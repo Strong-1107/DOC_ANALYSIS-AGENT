@@ -196,5 +196,22 @@ def verify_assistant_setup(client: OpenAI, assistant_id: str, vector_store_id: s
     print("Assistant properly configured with vector store")
     return True
 
+def create_or_retrieve_vector_store(client: OpenAI) -> any:
+    """Creates a new Vector Store or retrieves an existing one by name."""
+    try:
+        # Retrieve existing vector stores
+        vector_stores = client.beta.vector_stores.list(order="desc", order_by="created_at")
+        for vs in vector_stores.data:
+            if vs.name == VECTOR_STORE_NAME:
+                print(f"Found existing vector store with ID: {vs.id}")
+                return vs
+        # If no vector store with the specified name is found, create a new one
+        raise ValueError(f"No vector store found with name: {VECTOR_STORE_NAME}")
+    except Exception as e:
+        print(f"An error occurred while typing to retireve the vetor store" {e})
+        print("Creating a new vector store...")
 
+        vector_store = client.beta.vector_stores.create(name=VECTOR_STORE_NAME)
+        print(f"Vector store created with ID: {vector_store.id}")
+        return vector_store
 
