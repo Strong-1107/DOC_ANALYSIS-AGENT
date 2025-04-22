@@ -214,4 +214,53 @@ def create_or_retrieve_vector_store(client: OpenAI) -> any:
         vector_store = client.beta.vector_stores.create(name=VECTOR_STORE_NAME)
         print(f"Vector store created with ID: {vector_store.id}")
         return vector_store
+def uploaded_files_to_vector_store(client: OpenAI, vector_store_id: str, files_with_content: List[]) -> Doct:
+    """Upload files to the vector store."""
+    uploaded_file_ids = []
+    fid_to_fpath = {}
+    for file_data in files_with_content:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file_data["path"])[1], delete=False) as temp_file:
+                temp_file.write(file_data["content"].encode('utf-8'))
+                temp_file_path = temp_file.name
+            
+            with open(temp_file_path, "rb") as file_stream:
+                uploaded_file = client.files.create(file=file_stream, purpose="assistants")
+                uploaded_file_ids.append(uploaded_file.id)
+                fid_to_fpath[uploaded_file.id] = file_data['path']
+                print(f"Uploaded file {file_data['path']} with ID: {uploaded_file.id}")
+        except Exception as e:
+            print(f"Error uploading {file_data['path']}: {e}")
+        
+        finally:
+            if 'temp_file_path' in locals():
+                os.remove(temp_file_path)
+        if uploaded_file_ids:
+            file_batch_attachment = client.beta.vector_stores.file_batched.create(
+                vector_store_id = vector_store_id,
+                file_ids=uploaded_file_ids
+            )
 
+            #Wait for file processing to complete
+            while True:
+                file_batch_attachment = client.beta.vector_stores.file_batches.retrieve(
+                    vector_store_id=vector_store_id,
+                    batch_id=file_batch_attachment.id
+                )
+
+                if file_batch_attachment.status == "completed":
+                    print("File batch processing completed.")
+                    break
+                elif file_batch_attachment.status == "failed":
+                    print("File batch processing failed")
+                    exit(1)
+                print("Waiting for file batch processing...")
+                time.sleep(5)
+            print(f"File batch explicitly added to vector store. Status: {file_batch_attachment.status}")
+        else:
+            print("No files were successfully uploaded.")
+            exit(1)
+
+        return fid_to_fpath
+    def update_assistant(client: OpenAI, assistant_id: str, vector_store_id: str) -> None:
+            """Updates the Assistant to use the Vector Store."""
