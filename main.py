@@ -264,3 +264,195 @@ def uploaded_files_to_vector_store(client: OpenAI, vector_store_id: str, files_w
         return fid_to_fpath
     def update_assistant(client: OpenAI, assistant_id: str, vector_store_id: str) -> None:
             """Updates the Assistant to use the Vector Store."""
+            assistant = client.beta.assistants.update(
+                assistant_id = assistant_id,
+                tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}}
+            )
+            print("Assistant updated to use vector store.")
+
+            assistant = client.beta.assistants.retrieve(assistant_id)
+            print("\nAssistant Tool Resources:", assistant.tool_resources)
+
+            if not assistant.tool_resources.file_search or vector_store_id not in assistant.tool_resources.file_search.vector_store_ids:
+                print("Error: Assistant is NOT correctlyu linked to the vector store.")
+                exit(1)
+            else:
+                print("Assistant is corectly linked to vector store:", assistant.tool_resources.file_search.vector_store_ids)
+    def ask_question(client: OpenAI, assistant_id: str, question: str) -> Dict[str, str]:
+        """Vector store-enabled question handler"""
+        try:
+            #create new thread
+            thread = client.beta.threads.create()
+
+            # Add the question
+            client.beta.threads.messages.create(
+                thread_id=thread.id,
+                role="user",
+                content=f"Search the documents and answer: {question}"
+            )
+
+            # Create run with file search enabled
+            run = client.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=assistant_id,
+                instructions="""
+                Please address the used as Corbin. The user has a premium account.
+                Use file search to find relevant information.
+                Prioritize extracting information from the highest-ranked document according to the Authority Ranking.
+                Provide both a detailed answer and a brief summary.
+                Be extremely accurate.
+                Format the response as:
+                DETAILED ANSWER:
+                [Your detailed response here]
+
+                Summary:
+                [Your brief summary here]
+                """
+            )
+
+            # Wait for processing
+            while True:
+                run_status = client.beta.threads.runs.retrieve(
+                    thread_id=thread.id,
+                    run_id=run.id
+                )
+
+                if run_status.status == 'completed':
+                    #Get response with citations
+                    messages = client.beta.threads.messages.list(
+                        thread_id = thread.id,
+                        order="desc",
+                        limit=1
+                    )
+
+                    response = messages.data[0].content[0].text.value
+                    sources = []
+                    source_citations = []
+
+                    # Extract file citations
+                    for content in messages.data[0].content:
+                        if hasattr(content, 'text'):
+                           for annotation in content.text.annotations:
+                               if annotation.type == "file_citation":
+                                   file = client.files.retrieve(annotation.file_citation.file_id)
+                                   sources.append(file.filename)
+                                   source_citations.append(annotation.to_dict())
+
+                    # Parse response sections
+                    parts = response.split("SUMMARY:")
+                    detailed = parts[0].replace("DETAILED ANSWER:", "").strip()
+                    summary = parts[1].strip() if len(parts) > 1 else detailed[:200]
+
+                    return {
+                        "question": question,
+                        "answer": detailed,
+                        "summary": summary,
+                        "source": ", ".join(set(sources)) if sources else "No specific sources cited",
+                        "source_citations": source_citations
+                    }
+                if run_status in ['failed', 'cancelled', 'expired']:
+                    return {
+                        "question": question,
+                        "answer": f"Search failed: {run_status.status}",
+                        "summary": "Document search error",
+                        "source": "N/A",
+                        "source_citations": [],
+                    } 
+
+                time.sleep(1)
+
+        except Exception as e:
+            print(f"Error: {e}")
+            return {
+                "question": question,
+                "answer": str(e),
+                "summary": "Processing error",
+                "source": "N/A",
+                "source_citations": []
+            } 
+
+    def ask_questions(client: OpenAI, assistant_id: str, questions: List[str]) -> List[Dict[str, str]]:
+        """Sequential question processor"""
+        results = []
+
+        for idx, question in enumerate(questions, 1):
+            print(f"\nProcessing question {idx}/{len(questions)}")
+            result = ask_question(client, assistant_id, question)
+            results.append(result)
+            time.sleep(2)
+
+        return results
+    
+    def create_summary_table(fid_to_fpath: Dict[str, str], responses: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Generates a JSON summary table from the responses, prioritizing by authority ranking."""
+    summary_table = []
+    categories = [
+        "HOA Name",
+          "Monthly Dues", "Fee Increases", "Financial Health", "Reserve Fund",
+        "HOA Budget Allocation", "Management Reputation", "Documented Issues", "Community Rules", "Pet Policies",
+        "Short-Term Rentals", "Capital Improvements", "Community Amenities", "Governance Practices", "Enforcement Measures",
+        "Routine Maintenance", "Dispute Resolution", "Insurance Policies", "Legal Issues", "Resident Engagement"
+    ]
+
+    for i, category in enumerate(categories):
+        response = next((r for r in responses if r["question"].startswith(EXTRACTION_QUESTIONS[i][:50])), None)
+
+        if response:
+            summary_table.append({
+                "Category": category,
+                "Findings": response["summary"] ,
+                "Source": response["source_citations"]
+            })
+        else:
+            summary_table.append({"Category": category, "Findings": "No information found.", "Source": "N/A"})
+
+    return summary_table
+
+
+def main():
+    """Main function to orchestrate the process."""
+    try:
+        # 1. Prepare Files
+        files_with_content = prepare_files(HOA_DOCS_DIR)
+
+        # 2. Create or Retrieve Assistant and Vector Store
+        assistant = create_or_update_assistant(client)
+        vector_store = create_or_retrieve_vector_store(client)
+
+        # 3. Upload and process files
+        fid_to_fpath = upload_files_to_vector_store(client, vector_store.id, files_with_content)
+        update_assistant(client, assistant.id, vector_store.id)
+        
+        # 4. Verify setup before proceeding
+        if not verify_assistant_setup(client, assistant.id, vector_store.id):
+            raise Exception("Assistant setup verification failed")
+        
+        # 5. Ask Questions
+        responses = ask_questions(client, assistant.id, EXTRACTION_QUESTIONS)
+        
+        # 6. Create Summary Table
+        summary_table = create_summary_table(fid_to_fpath, responses)
+        
+        # 7. Output JSON
+        if not os.path.exists(OUTPUT_DIR):
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        print("\nSaving JSON Summary Table...")
+        summary_fname = os.path.join(OUTPUT_DIR, "{}-summary.json".format(datetime.now().strftime("%Y-%m-%d %H-%M-%S")))
+        with open(summary_fname, "w") as s_f:
+            json.dump(summary_table, s_f, indent=4)
+        print("\nSummary Table saved as:", summary_fname)
+
+        print("\nSaving JSON Answer Table...")
+        answers_fname = os.path.join(OUTPUT_DIR, "{}-answers.json".format(datetime.now().strftime("%Y-%m-%d %H-%M-%S")))
+        with open(answers_fname, "w") as a_f:
+            json.dump(responses, a_f, indent=4)
+        print("Answers saved as:", answers_fname)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        print("Exiting program.")
+
+if __name__ == "__main__":
+    main()
